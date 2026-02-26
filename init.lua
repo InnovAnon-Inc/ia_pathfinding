@@ -9,6 +9,7 @@ local files = {
     "movement",
     "pathfinding",
     "registration",
+    "scavenge",
 }
 
 -- Load each module
@@ -20,42 +21,22 @@ for _, file in ipairs(files) do
     chunk()
 end
 
------ Constructor for a new Dunce instance.
----- Wraps an ia_fakelib object with our village-worker logic.
----- @param self_obj The base entity object (from ia_fakelib)
---function ia_pathfinding.init_instance(self_obj)
---    -- This allows us to call ia_pathfinding methods directly on the entity
---    -- without overwriting the base ia_fakelib methods.
---    for name, func in pairs(ia_pathfinding) do
---        if name ~= "init_instance" then
---            self_obj[name] = func
---        end
---    end
---    
---    minetest.log("action", "[ia_pathfinding] Initialized worker logic for: " .. (self_obj:get_player_name() or "unknown"))
---end
 function ia_pathfinding.init_instance(self_obj)
-	minetest.log('ia_pathfinding.init_instance()')
-    -- Inject methods
+    minetest.log('action', '[ia_pathfinding] Initializing instance for entity')
+
+    -- Inject all functions from ia_pathfinding into the entity
     for name, func in pairs(ia_pathfinding) do
-        if name ~= "init_instance" and name ~= "register_dunce_entity" and name ~= "register_pathfinding_entity" then
+        -- Skip the registration and init functions themselves
+        if name ~= "init_instance" and
+           name ~= "register_pathfinding_entity" and
+           type(func) == "function" then
+
             self_obj[name] = func
         end
     end
-    
-    -- Safe logging with a fallback
-    local name = "Unknown"
-    if self_obj.get_player_name then
-        name = self_obj:get_player_name()
-    elseif self_obj.fake_player and self_obj.fake_player.get_player_name then
-        name = self_obj.fake_player:get_player_name()
-    end
 
-    self_obj._last_pos = vector.new(0,0,0)
-    self_obj._stagnant_ticks = 0
-
-    minetest.log("action", "[ia_pathfinding] Worker logic attached to: " .. name)
+    -- Initialize pathfinding-specific state
+    self_obj._current_path = nil
+    self_obj._path_index = 1
+    self_obj._scan_timer = 0
 end
-
-minetest.log("action", "[ia_pathfinding] API Loaded Successfully.")
-
