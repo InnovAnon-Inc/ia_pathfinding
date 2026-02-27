@@ -1,215 +1,561 @@
 -- ia_pathfinding/pathfinding.lua
+-- NOTE must handle optionally digging, climbing, swimming, flying, etc
 
-local PF_BUDGET = 100 -- How many nodes to check per tick
-local MAX_NODES = 1000 -- Maximum search depth before giving up
+--------- Helper: Returns the configuration table for the star pathfinder.
+------function ia_pathfinding.get_search_settings(self)
+------    -- `width`: Specifies the object size along x- and z-axes. Defaults to `1`.
+------    -- `height`: Specifies the object size along the y-axis. Defaults to `2`.
+------    -- `max_jump`: Specifies the maximum jump height. Defaults to `1`.
+------    -- `max_drop`: Specifies the maximum drop height. Defaults to `1`.
+------    -- `max_iter`: Specifies the maximum number of main loop iterations before quitting. Defaults to `256`. For now, has a hard limit of `1024`.
+------    -- `climb`: Sets the ability to climb ladders (`true` or `false`). Defaults to `false`.
+------    local settings = {}
+------    settings.max_iter = 1024
+------    -- Future: Add digging/climbing capabilities here
+------    return settings
+------end
+------
+--------- Helper: Validates if the target object or node still exists.
+------function ia_pathfinding.is_target_still_valid(target)
+------    if not target then return false end
+------
+------    -- Handle Minetest Objects (Players, Dropped Items, Mobs)
+------    if type(target) == "userdata" or (type(target) == "table" and target.get_pos) then
+------        if not ia_dunce.is_valid_object(target) then return false end
+------        -- Check if dropped item is still real (not picked up)
+------        local ent = target:get_luaentity()
+------        if ent and ent.name == "__builtin:item" and ent.itemstring == "" then
+------            return false
+------        end
+------        return true
+------    end
+------
+------    -- Handle positions
+------    if type(target) == "table" and target.x then
+------        local node = minetest.get_node_or_nil(target)
+------        if not node or node.name == "ignore" then return false end
+------        return true
+------    end
+------
+------    return false
+------end
+------
+--------- Helper: Removes redundant nodes from the library output.
+-------- This makes the path followable by the movement logic.
+------function ia_pathfinding.smooth_path(path)
+------    if not path or #path <= 2 then return path end
+------    local smoothed = {path[1]}
+------    local current_index = 1
+------
+------    while current_index < #path do
+------        local last_visible = current_index + 1
+------        local max_look = math.min(current_index + 8, #path)
+------
+------        for look_ahead = current_index + 2, max_look do
+------            -- Only skip nodes if there is a clear line of sight
+------            if ia_dunce.is_line_of_sight_clear(path[current_index], path[look_ahead]) then
+------                last_visible = look_ahead
+------            else
+------                break
+------            end
+------        end
+------
+------        table.insert(smoothed, path[last_visible])
+------        current_index = last_visible
+------    end
+------    return smoothed
+------end
+------
+--------- Helper: Updates the entity's pathing state variables.
+------function ia_pathfinding.apply_path_to_actor(self, path)
+------    -- Path smoothing prevents the mob from stuttering on raw node-by-node steps
+------    self._current_path = ia_pathfinding.smooth_path(path)
+------    self._path_index = 1
+------end
+------
+--------- Helper: Handles logic when a path cannot be found.
+------function ia_pathfinding.handle_path_failure(self, my_pos, actual_dest)
+------    if ia_dunce.is_line_of_sight_clear(my_pos, actual_dest) then
+------        ia_pathfinding.apply_path_to_actor(self, {actual_dest})
+------    else
+------        self._current_path = nil
+------        ia_dunce.stop(self)
+------    end
+------end
+------
+--------- Helper: Finds the nearest navigable ground near a target position.
+------function ia_pathfinding.get_navigable_destination(self, pos)
+------    if not pos then return nil end
+------
+------    local node = minetest.get_node(pos)
+------    local def = minetest.registered_nodes[node.name]
+------
+------    if def and def.walkable then
+------        -- Search upward for a 2-block air gap
+------        for dy = 1, 3 do
+------            local up = vector.add(pos, {x=0, y=dy, z=0})
+------            local up_node = minetest.get_node(up)
+------            local up_def = minetest.registered_nodes[up_node.name]
+------            if up_def and not up_def.walkable then
+------                return up
+------            end
+------        end
+------        local ground = ia_dunce.find_ground_level(pos, 1, 5)
+------        return ground or pos
+------    end
+------
+------    return pos
+------end
+------
+--------- Wrapper for the 'star' mod pathfinder.
+------function ia_pathfinding.calculate_star_path(self, start, dest)
+------    local settings = ia_pathfinding.get_search_settings(self)
+------    local path = star.find_path(start, dest, settings)
+------
+------    if path and #path > 0 then
+------        return path
+------    end
+------    return nil
+------end
+------
+--------- Starts a pathfinding task.
+------function ia_pathfinding.find_path_to(self, target_pos, overrides)
+------    local my_pos = self.object:get_pos()
+------    
+------    if not my_pos or not target_pos then return end
+------
+------    -- Shortcut: Direct movement if clear line of sight exists
+------    if ia_dunce.is_line_of_sight_clear(my_pos, target_pos) then
+------        ia_pathfinding.apply_path_to_actor(self, {target_pos})
+------        self._path_target = vector.new(target_pos)
+------        return
+------    end
+------
+------    local actual_dest = ia_pathfinding.get_navigable_destination(self, target_pos)
+------
+------    -- Optimization: Skip calculation if target hasn't moved significantly
+------    if self._path_target and vector.distance(self._path_target, actual_dest) < 0.2 then
+------        if self._current_path then return end
+------    end
+------
+------    self._path_target = vector.new(actual_dest)
+------
+------    local result = ia_pathfinding.calculate_star_path(self, my_pos, actual_dest)
+------
+------    if result then
+------        ia_pathfinding.apply_path_to_actor(self, result)
+------    else
+------        ia_pathfinding.handle_path_failure(self, my_pos, actual_dest)
+------    end
+------end
+------
+--------- Process lifecycle health-check.
+------function ia_pathfinding.process_pathfinding(self)
+------    -- Ensure the mob stops if its current chase target (e.g. apple) vanishes
+------    if self._target_object and not ia_pathfinding.is_target_still_valid(self._target_object) then
+------        self._current_path = nil
+------        self._target_object = nil
+------        ia_dunce.stop(self)
+------    end
+------end
+------ ia_pathfinding/pathfinding.lua
+----
+------- Helper: Resets all navigation-related state variables.
+----function ia_pathfinding.clear_pathing_state(self)
+----    self._current_path = nil
+----    self._path_index = 1
+----    self._path_target = nil
+----    self._target_object = nil
+----    self._target_data = nil
+----    ia_dunce.stop(self)
+----end
+----
+------- Helper: Returns the configuration table for the star pathfinder.
+----function ia_pathfinding.get_search_settings(self)
+----    local settings = {}
+----    settings.max_iter = 1024
+----    return settings
+----end
+----
+------- Helper: Validates if the target object or node still exists.
+----function ia_pathfinding.is_target_still_valid(target)
+----    if not target then return false end
+----
+----    if type(target) == "userdata" or (type(target) == "table" and target.get_pos) then
+----        if not ia_dunce.is_valid_object(target) then return false end
+----        local ent = target:get_luaentity()
+----        if ent and ent.name == "__builtin:item" and ent.itemstring == "" then
+----            return false
+----        end
+----        return true
+----    end
+----
+----    if type(target) == "table" and target.x then
+----        local node = minetest.get_node_or_nil(target)
+----        if not node or node.name == "ignore" then return false end
+----        return true
+----    end
+----
+----    return false
+----end
+----
+------- Helper: Removes redundant nodes from the library output.
+----function ia_pathfinding.smooth_path(path)
+----    if not path or #path <= 2 then return path end
+----    local smoothed = {path[1]}
+----    local current_index = 1
+----
+----    while current_index < #path do
+----        local last_visible = current_index + 1
+----        local max_look = math.min(current_index + 8, #path)
+----
+----        for look_ahead = current_index + 2, max_look do
+----            if ia_dunce.is_line_of_sight_clear(path[current_index], path[look_ahead]) then
+----                last_visible = look_ahead
+----            else
+----                break
+----            end
+----        end
+----
+----        table.insert(smoothed, path[last_visible])
+----        current_index = last_visible
+----    end
+----    return smoothed
+----end
+----
+------- Helper: Updates the entity's pathing state variables.
+----function ia_pathfinding.apply_path_to_actor(self, path)
+----    self._current_path = ia_pathfinding.smooth_path(path)
+----    self._path_index = 1
+----end
+----
+------- Helper: Handles logic when a path cannot be found.
+----function ia_pathfinding.handle_path_failure(self, my_pos, actual_dest)
+----    if ia_dunce.is_line_of_sight_clear(my_pos, actual_dest) then
+----        ia_pathfinding.apply_path_to_actor(self, {actual_dest})
+----    else
+----        ia_pathfinding.clear_pathing_state(self)
+----    end
+----end
+----
+------- Helper: Finds the nearest navigable ground near a target position.
+----function ia_pathfinding.get_navigable_destination(self, pos)
+----    if not pos then return nil end
+----
+----    local node = minetest.get_node(pos)
+----    local def = minetest.registered_nodes[node.name]
+----
+----    -- If the target is inside a solid block, look for air above it
+----    if def and def.walkable then
+----        for dy = 1, 3 do
+----            local up = vector.add(pos, {x=0, y=dy, z=0})
+----            local up_node = minetest.get_node(up)
+----            local up_def = minetest.registered_nodes[up_node.name]
+----            if up_def and not up_def.walkable then
+----                return up
+----            end
+----        end
+----    end
+----
+----    -- If target is in air, ensure we find the floor beneath it
+----    local ground = ia_dunce.find_ground_level(pos, 1, 5)
+----    return ground or pos
+----end
+----
+------- Wrapper for the 'star' mod pathfinder.
+----function ia_pathfinding.calculate_star_path(self, start, dest)
+----    local settings = ia_pathfinding.get_search_settings(self)
+----    local path = star.find_path(start, dest, settings)
+----
+----    if path and #path > 0 then
+----        return path
+----    end
+----    return nil
+----end
+----
+------- Starts a pathfinding task.
+----function ia_pathfinding.find_path_to(self, target_pos, overrides)
+----    local my_pos = self.object:get_pos()
+----    if not my_pos or not target_pos then return end
+----
+----    if ia_dunce.is_line_of_sight_clear(my_pos, target_pos) then
+----        ia_pathfinding.apply_path_to_actor(self, {target_pos})
+----        self._path_target = vector.new(target_pos)
+----        return
+----    end
+----
+----    local actual_dest = ia_pathfinding.get_navigable_destination(self, target_pos)
+----
+----    -- FIX: Lowered threshold and ensured calculation runs if no path exists
+----    if self._path_target and vector.distance(self._path_target, actual_dest) < 0.1 then
+----        if self._current_path then return end
+----    end
+----
+----    self._path_target = vector.new(actual_dest)
+----    local result = ia_pathfinding.calculate_star_path(self, my_pos, actual_dest)
+----
+----    if result then
+----        ia_pathfinding.apply_path_to_actor(self, result)
+----    else
+----        ia_pathfinding.handle_path_failure(self, my_pos, actual_dest)
+----    end
+----end
+----
+------- Process lifecycle health-check.
+----function ia_pathfinding.process_pathfinding(self)
+----    if self._target_object and not ia_pathfinding.is_target_still_valid(self._target_object) then
+----        ia_pathfinding.clear_pathing_state(self)
+----    end
+----end
+---- ia_pathfinding/pathfinding.lua
+---- Integrated with 'star' mod for robust A* calculation
+--
+----- Helper: Resets all navigation-related state variables.
+---- Each line of code should do just one thing and be self-documenting.
+--function ia_pathfinding.clear_pathing_state(self)
+--    self._current_path = nil -- Remove current route
+--    self._path_index = 1     -- Reset progress
+--    self._path_target = nil  -- Clear destination memory
+--    self._target_object = nil -- Clear tracked entity
+--    self._target_data = nil   -- Clear metadata
+--    ia_dunce.stop(self)       -- Physically stop velocity
+--end
+--
+----- Helper: Returns true if the mob has no current movement goals.
+--function ia_pathfinding.is_idle(self)
+--    return self._current_path == nil or self._path_index > #self._current_path
+--end
+--
+----- Helper: Returns the configuration table for the star pathfinder.
+--function ia_pathfinding.get_search_settings(self)
+--    local settings = {}
+--    settings.max_iter = 1024
+--    return settings
+--end
+--
+----- Helper: Validates if the target object or node still exists.
+--function ia_pathfinding.is_target_still_valid(target)
+--    if not target then return false end
+--
+--    -- Handle Minetest Objects (Players, Dropped Items, Mobs)
+--    if type(target) == "userdata" or (type(target) == "table" and target.get_pos) then
+--        if not ia_dunce.is_valid_object(target) then return false end
+--        -- Check if dropped item is still real (not picked up)
+--        local ent = target:get_luaentity()
+--        if ent and ent.name == "__builtin:item" and ent.itemstring == "" then
+--            return false
+--        end
+--        return true
+--    end
+--
+--    -- Handle positions
+--    if type(target) == "table" and target.x then
+--        local node = minetest.get_node_or_nil(target)
+--        if not node or node.name == "ignore" then return false end
+--        return true
+--    end
+--
+--    return false
+--end
+--
+----- Helper: Removes redundant nodes from the library output.
+--function ia_pathfinding.smooth_path(path)
+--    if not path or #path <= 2 then return path end
+--    local smoothed = {path[1]}
+--    local current_index = 1
+--
+--    while current_index < #path do
+--        local last_visible = current_index + 1
+--        local max_look = math.min(current_index + 8, #path)
+--
+--        for look_ahead = current_index + 2, max_look do
+--            -- Only skip nodes if there is a clear line of sight
+--            if ia_dunce.is_line_of_sight_clear(path[current_index], path[look_ahead]) then
+--                last_visible = look_ahead
+--            else
+--                break
+--            end
+--        end
+--
+--        table.insert(smoothed, path[last_visible])
+--        current_index = last_visible
+--    end
+--    return smoothed
+--end
+--
+----- Helper: Updates the entity's pathing state variables.
+--function ia_pathfinding.apply_path_to_actor(self, path)
+--    -- Path smoothing prevents the mob from stuttering on raw node-by-node steps
+--    self._current_path = ia_pathfinding.smooth_path(path)
+--    self._path_index = 1
+--end
+--
+----- Helper: Handles logic when a path cannot be found.
+--function ia_pathfinding.handle_path_failure(self, my_pos, actual_dest)
+--    -- If A* failed, try one last direct dash if clear, otherwise give up.
+--    if ia_dunce.is_line_of_sight_clear(my_pos, actual_dest) then
+--        ia_pathfinding.apply_path_to_actor(self, {actual_dest})
+--    else
+--        ia_pathfinding.clear_pathing_state(self)
+--    end
+--end
+--
+----- Helper: Finds the nearest navigable ground near a target position.
+--function ia_pathfinding.get_navigable_destination(self, pos)
+--    if not pos then return nil end
+--
+--    local node = minetest.get_node(pos)
+--    local def = minetest.registered_nodes[node.name]
+--
+--    -- If target is inside a solid block, look for air above it
+--    if def and def.walkable then
+--        for dy = 1, 3 do
+--            local up = vector.add(pos, {x=0, y=dy, z=0})
+--            local up_node = minetest.get_node(up)
+--            local up_def = minetest.registered_nodes[up_node.name]
+--            if up_def and not up_def.walkable then
+--                return up
+--            end
+--        end
+--    end
+--
+--    -- If target is in air (floating item), find the floor beneath it
+--    local ground = ia_dunce.find_ground_level(pos, 1, 5)
+--    return ground or pos
+--end
+--
+----- Wrapper for the 'star' mod pathfinder.
+--function ia_pathfinding.calculate_star_path(self, start, dest)
+--    local settings = ia_pathfinding.get_search_settings(self)
+--    local path = star.find_path(start, dest, settings)
+--
+--    if path and #path > 0 then
+--        return path
+--    end
+--    return nil
+--end
+--
+----- Starts a pathfinding task.
+--function ia_pathfinding.find_path_to(self, target_pos, overrides)
+--    local my_pos = self.object:get_pos()
+--    if not my_pos or not target_pos then return end
+--
+--    -- REFACTOR: Removed the early LOS shortcut. 
+--    -- We now rely on the 'star' module to provide the path first.
+--
+--    local actual_dest = ia_pathfinding.get_navigable_destination(self, target_pos)
+--
+--    -- Optimization: Skip calculation if target hasn't moved significantly
+--    if self._path_target and vector.distance(self._path_target, actual_dest) < 0.1 then
+--        if self._current_path then return end
+--    end
+--
+--    self._path_target = vector.new(actual_dest)
+--
+--    local result = ia_pathfinding.calculate_star_path(self, my_pos, actual_dest)
+--
+--    if result then
+--        ia_pathfinding.apply_path_to_actor(self, result)
+--    else
+--        ia_pathfinding.handle_path_failure(self, my_pos, actual_dest)
+--    end
+--end
+--
+----- Process lifecycle health-check.
+--function ia_pathfinding.process_pathfinding(self)
+--    -- Ensure the mob stops if its current chase target (e.g. apple) vanishes
+--    if self._target_object and not ia_pathfinding.is_target_still_valid(self._target_object) then
+--        ia_pathfinding.clear_pathing_state(self)
+--    end
+--end
+-- ia_pathfinding/pathfinding.lua
+-- Minimalist wrapper for the 'star' mod.
 
--- TODO dynamically adjust depending on actual time taken or server load?
--- i.e., better a* if resources allow for it
-
---- Internal: Follows parents back to the start
-function ia_pathfinding._reconstruct_path(node)
-	--minetest.log('ia_pathfinding._reconstruct_path()')
-    local path = {}
-    local curr = node
-    while curr do
-        table.insert(path, 1, curr.pos)
-        curr = curr.parent
-    end
-    return path
-end
-
-function ia_pathfinding.get_node_cost(self, pos)
-	--minetest.log('ia_pathfinding.get_node_cost()')
-    local node = minetest.get_node(pos)
-    local node_name = node.name
-    local is_walkable, height = ia_dunce.get_node_properties(node_name)
-
-    -- 1. Handle Doors (A* should prefer these over walls)
-    if minetest.get_item_group(node_name, "door") > 0 then
-        return 2.0 -- Cost of "opening" the door
-    end
-
-    -- 2. Physical Obstacles
-    if not is_walkable then return 1 end
-    if height > 1.1 then return 999 end
-
-    -- 3. Social Cost (Crowds)
-    if ia_dunce.is_node_occupied(pos, self.object) then
-        return 25
-    end
-
-    -- 4. Digging Cost
-    if ia_dunce.can_dig_node then
-        local can_dig, time = ia_dunce.can_dig_node(self, node_name)
-        if can_dig then return 1 + (time * 5) end
-    end
-
-    return 1
-end
-
---- High-level path trigger.
--- Now detects if the target object has moved significantly.
-function ia_pathfinding.find_path_to(self, target_pos)
-	minetest.log('ia_pathfinding.find_path_to()')
-    local actual_dest = self:get_navigable_destination(target_pos)
-
-    -- Detect if the target has moved more than 1 block from our last calculation
-    local target_moved = false
-    if self._path_target then
-        if vector.distance(self._path_target, actual_dest) > 1.0 then
-            target_moved = true
-        end
-    end
-
-    -- If we are already heading there and it hasn't moved, stay the course.
-    if not target_moved and self._path_target and vector.equals(self._path_target, actual_dest) then
-        if self._current_path or self._path_thread then
-            return 
-        end
-    end
-
-    -- Reset and start new search
-    self._current_path = nil
-    self._path_target = vector.new(actual_dest)
-    
-    local my_pos = self.object:get_pos()
-    if not my_pos then return end
-    
-    self._path_thread = ia_pathfinding.create_path_coroutine(self, my_pos, actual_dest)
-end
-
---- Finds a reachable empty space near a target.
-function ia_pathfinding.get_navigable_destination(self, target_pos)
-	minetest.log('ia_pathfinding.get_navigable_destination()')
-    if not ia_dunce.is_node_occupied(target_pos, self.object) then
-        return target_pos
-    end
-
-    local neighbors = ia_pathfinding._get_neighbors(target_pos)
-    for _, pos in ipairs(neighbors) do
-        if not ia_dunce.is_node_occupied(pos, self.object) then
-            return pos
-        end
-    end
-    return target_pos
-end
-
-function ia_pathfinding._get_neighbors(pos)
-	--minetest.log('ia_pathfinding._get_neighbors()')
-    if not pos or not pos.y then 
-        return {} 
-    end
-
-    local offsets = {
-        {x = 1,  y = 0, z = 0}, 
-        {x = -1, y = 0, z = 0}, 
-        {x = 0,  y = 0, z = 1}, 
-        {x = 0,  y = 0, z = -1}
+--- Helper: Settings for the star pathfinder.
+function ia_pathfinding.get_search_settings(self)
+    return {
+        max_iter = 1024,
+        max_jump = 1,
+        max_drop = 3,
+        climb = true,
     }
-    
-    local valid = {}
-    
-    for _, o in ipairs(offsets) do
-        local check_pos = vector.add(pos, o)
-        -- Use our ground finder (Jump 1, Fall 3) to find valid walking surfaces
-        local ground = ia_dunce.find_ground_level(check_pos, 1, 3)
-
-        if ground then 
-            table.insert(valid, ground) 
-        end
-    end
-    
-    return valid
 end
 
---- Internal: Selects node with lowest f-score.
-function ia_pathfinding._get_best_node(set)
-	--minetest.log('ia_pathfinding._get_best_node()')
-    local best_id, best_node = nil, nil
-    local min_f = math.huge
-    for id, node in pairs(set) do
-        local f = node.g + node.h
-        if f < min_f then
-            min_f = f
-            best_id, best_node = id, node
-        end
-    end
-    return best_id, best_node
+--- Updates the entity's pathing state.
+function ia_pathfinding.apply_path_to_actor(self, path)
+    self._current_path = path
+    self._path_index = 1
 end
 
---- Creates the A* coroutine thread.
-function ia_pathfinding.create_path_coroutine(self, start, dest)
-	minetest.log('ia_pathfinding.create_path_coroutine()')
-    return coroutine.create(function()
-        local open_set = { [vector.to_string(start)] = {pos = start, g = 0, h = vector.distance(start, dest)} }
-        local closed_set = {}
-        local count = 0
-        local closed_count = 0
+--- The main pathfinding entry point.
+--function ia_pathfinding.find_path_to(self, target_pos)
+--    local my_pos = self.object:get_pos()
+--    if not my_pos or not target_pos then return end
+--
+--    -- NO LOS SHORTCUT: We trust the A* library to find the way.
+--    -- NO DISTANCE OPTIMIZATION: We update every time we're told to.
+--
+--    local settings = ia_pathfinding.get_search_settings(self)
+--    local path = star.find_path(my_pos, target_pos, settings)
+--
+--    if path and #path > 0 then
+--        ia_pathfinding.apply_path_to_actor(self, path)
+--    else
+--        -- If pathfinding fails, we clear the path so we don't walk into walls.
+--        self._current_path = nil
+--    end
+--end
 
-        while next(open_set) do
-            local current_id, current = ia_pathfinding._get_best_node(open_set)
-
-            if vector.distance(current.pos, dest) <= 1.1 then
-                local path = {}
-                local curr = current
-                while curr do
-                    table.insert(path, 1, curr.pos)
-                    curr = curr.parent
-                end
-                return path
-            end
-
-            open_set[current_id] = nil
-            closed_set[current_id] = current
-
-            for _, neighbor_pos in ipairs(ia_pathfinding._get_neighbors(current.pos)) do
-                local neighbor_id = vector.to_string(neighbor_pos)
-                if not closed_set[neighbor_id] then
-                    local cost = ia_pathfinding.get_node_cost(self, neighbor_pos)
-                    if cost < 999 then
-                        local g_score = current.g + cost
-                        if not open_set[neighbor_id] or g_score < open_set[neighbor_id].g then
-                            open_set[neighbor_id] = {
-                                pos = neighbor_pos, parent = current,
-                                g = g_score, h = vector.distance(neighbor_pos, dest)
-                            }
-                        end
-                    end
-                end
-            end
-
-            count = count + 1
-            closed_count = closed_count + 1
-            if count >= PF_BUDGET then
-                count = 0
-                coroutine.yield(nil)
-            end
-            if closed_count > MAX_NODES then return nil end
-        end
-        return nil
-    end)
-end
-
---- Triggers pathing and manages coroutine lifecycle.
+--- Lifecycle check: Clears path if the target entity (like an apple) is gone.
 function ia_pathfinding.process_pathfinding(self)
-	--minetest.log('ia_pathfinding.process_pathfinding()')
     if self._target_object and not ia_dunce.is_valid_object(self._target_object) then
         self._current_path = nil
-        self._path_thread = nil
-        ia_dunce.stop(self)
-        return
+        self._target_object = nil
     end
+end
 
-    if not self._path_thread then return end
 
-    local status, result = coroutine.resume(self._path_thread)
-    if coroutine.status(self._path_thread) == "dead" then
-        self._path_thread = nil
-        if status and result and #result > 0 then
-            self._current_path = result
-            self._path_index = ia_dunce.is_at(self, result[1], 0.8) and 2 or 1
-        else
-            self._current_path = nil
-        end
+
+
+
+
+-- ia_pathfinding/pathfinding.lua
+
+--- Helper: Returns true if the mob has no current movement goals.
+function ia_pathfinding.is_idle(self)
+    return self._current_path == nil or self._path_index > #self._current_path
+end
+
+--- Helper: Resets pathing state.
+function ia_pathfinding.clear_pathing_state(self)
+    self._current_path = nil
+    self._path_index = 1
+    self._path_target = nil
+    self._target_object = nil
+end
+
+-- ... [get_search_settings and is_target_still_valid remain the same] ...
+
+--- Starts a pathfinding task.
+function ia_pathfinding.find_path_to(self, target_pos)
+    local my_pos = self.object:get_pos()
+    if not my_pos or not target_pos then return end
+
+    -- CHANGE: Removed the Line of Sight shortcut.
+    -- We now rely entirely on 'star' to find the most valid route.
+
+    local actual_dest = ia_pathfinding.get_navigable_destination(self, target_pos)
+
+    -- CHANGE: Removed distance optimization.
+    -- If this function is called, we force a fresh path calculation.
+    self._path_target = vector.new(actual_dest)
+
+    local settings = ia_pathfinding.get_search_settings(self)
+    local result = star.find_path(my_pos, actual_dest, settings)
+
+    if result and #result > 0 then
+        ia_pathfinding.apply_path_to_actor(self, result)
+    else
+        ia_pathfinding.clear_pathing_state(self)
     end
 end
