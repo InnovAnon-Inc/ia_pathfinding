@@ -220,10 +220,12 @@ function ia_pathfinding.handle_scavenging(self, requirements)
 
     -- 1. BRAIN: Only look for new items if we aren't already walking to one.
     if ia_pathfinding.is_idle(self) then
+	    --minetest.log('ia_pathfinding.handle_scavenging() pathfinding is idle')
         local filter = function(stack) return matches_requirement(stack, requirements, self) end
         local items = self:find_items(20, filter)
         
         if #items > 0 then
+		minetest.log('ia_pathfinding.handle_scavenging() finding path')
             self._target_object = items[1].object
             self:find_path_to(items[1].pos)
         end
@@ -231,6 +233,7 @@ function ia_pathfinding.handle_scavenging(self, requirements)
 
     -- 2. LEGS: If we have a path, walk it.
     if not ia_pathfinding.is_idle(self) then
+	    minetest.log('ia_pathfinding.handle_scavenging() following path')
         self:follow_path()
         return true
     end
