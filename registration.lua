@@ -4,14 +4,30 @@ function ia_pathfinding.register_pathfinding_entity(name, definition)
     -- CHANGE: Standardized all whitespace to standard ASCII spaces to fix syntax error
     minetest.log('action', '[ia_pathfinding] Registering: ' .. name)
     
+    local final_def        = table.copy(definition)
     local user_on_activate = definition.on_activate
-    local user_on_step = definition.on_step
+    local user_on_step     = definition.on_step
 
     -- Injected On Step: The Brain Tick
-    definition.on_step = function(self, dtime)
+    final_def.on_step = function(self, dtime)
+	assert(self)
+	assert(self.object)
+	assert(self:get_hp() > 0)
+	local pos     = self:get_pos()
+	if pos == nil then
+		minetest.log('ia_humanoid.on_step() no pos')
+		return
+	end
+	assert(pos ~= nil)
         -- 1. Process Pathfinding Coroutines
-        if ia_pathfinding.process_pathfinding then
+        --if ia_pathfinding.process_pathfinding then
             ia_pathfinding.process_pathfinding(self)
+        --end
+
+	local hp = self:get_hp()
+	minetest.log('ia_pathfinding.on_step() '..self:get_player_name()..' hp='..hp)
+	if hp <= 0 then
+            return
         end
 
         -- 2. Run the user's specific mob logic (on_step from ia_mob)
@@ -21,7 +37,7 @@ function ia_pathfinding.register_pathfinding_entity(name, definition)
     end
 
     -- We must override the on_activate that ia_dunce would have set
-    definition.on_activate = function(self, staticdata, dtime_s)
+    final_def.on_activate = function(self, staticdata, dtime_s)
         -- 1. Initialize Dunce (Base Layer)
         ia_dunce.init_instance(self)
         assert(self:is_player() == true)
@@ -39,5 +55,5 @@ function ia_pathfinding.register_pathfinding_entity(name, definition)
 
     -- Delegate the actual registration to ia_dunce
     -- ia_dunce will then delegate to ia_humanoid
-    ia_dunce.register_dunce_entity(name, definition)
+    ia_dunce.register_dunce_entity(name, final_def)
 end
