@@ -52,6 +52,10 @@ function ia_pathfinding.move_to_waypoint(self, target)
     return false
 end
 
+-- FIXME missing walking animation
+-- FIXME why do they hop so much?
+-- FIXME why are they drifting when they stop?
+
 --- Iterates through the current path.
 function ia_pathfinding.follow_path(self)
     if not self._current_path then return false end

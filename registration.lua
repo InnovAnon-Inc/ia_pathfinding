@@ -24,14 +24,17 @@ function ia_pathfinding.register_pathfinding_entity(name, definition)
     definition.on_activate = function(self, staticdata, dtime_s)
         -- 1. Initialize Dunce (Base Layer)
         ia_dunce.init_instance(self)
+        assert(self:is_player() == true)
         
         -- 2. Initialize Pathfinding (This Layer - provides handle_scavenging, etc.)
         ia_pathfinding.init_instance(self)
+        assert(self:is_player() == true)
         
         -- 3. Run original mob logic
         if user_on_activate then
             user_on_activate(self, staticdata, dtime_s)
         end
+        assert(self:is_player() == true)
     end
 
     -- Delegate the actual registration to ia_dunce
