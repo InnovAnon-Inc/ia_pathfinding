@@ -1,6 +1,8 @@
 -- ia_pathfinding/pathfinding.lua
 -- NOTE must handle optionally digging, climbing, swimming, flying, etc
 
+-- mods/ia_pathfinding/pathfinding.lua
+
 --- Helper: Converts star's flat path into a list of vectors for our movement logic.
 -- @param flat_path Table from star.lua [x_dest, y_dest, z_dest, ..., x_start, y_start, z_start]
 local function format_star_path(flat_path)
@@ -25,26 +27,6 @@ local function format_star_path(flat_path)
     return path
 end
 
---- Generates a customized passable table for the current search.
--- This allows the pathfinder to "see" through doors.
-local function get_door_aware_passable()
-    local custom_passable = {}
-    -- Copy the default passable list from star mod
-    for id, val in pairs(star.d_passable) do
-        custom_passable[id] = val
-    end
-
-    -- Force all nodes in the 'door' group to be passable (0)
-    for name, def in pairs(minetest.registered_nodes) do
-        if minetest.get_item_group(name, "door") > 0 then
-            local id = minetest.get_content_id(name)
-            custom_passable[id] = 0
-        end
-    end
-
-    return custom_passable
-end
-
 function ia_pathfinding.get_search_settings(self)
     -- star.lua uses 'max_iterations' for the iteration limit.
     return {
@@ -64,6 +46,9 @@ end
 
 --- Requests a path to a position.
 function ia_pathfinding.find_path_to(self, target_pos)
+    -- Assertion: Ensure self.object is valid before attempting pathfinding
+    assert(self.object, "find_path_to called on entity with nil object")
+
     local my_pos = self.object:get_pos()
     if not my_pos or not target_pos then return end
 
@@ -73,22 +58,14 @@ function ia_pathfinding.find_path_to(self, target_pos)
 
     local settings = ia_pathfinding.get_search_settings(self)
 
-    -- CHANGE: Hot-swap star's passable table.
-    -- Since star.lua uses star.d_passable directly and ignores the settings.passable key,
-    -- we temporarily swap the global table to allow doors to be treated as passable.
-    local original_passable = star.d_passable
-    star.d_passable = get_door_aware_passable()
-
-    -- Execute the A* search
+    -- Execute the A* search using default star.d_passable
     local flat_result = star.find_path(start, dest, settings)
-
-    -- Restore original passable table immediately
-    star.d_passable = original_passable
 
     -- Convert the flat numerical table to a list of vector objects
     local formatted_path = format_star_path(flat_result)
 
     if formatted_path and #formatted_path > 0 then
+        -- Update pathing state
         self._current_path = formatted_path
         self._path_index = 1
         self._path_target = vector.new(target_pos)
@@ -100,20 +77,18 @@ function ia_pathfinding.find_path_to(self, target_pos)
 end
 
 function ia_pathfinding.process_pathfinding(self)
-    -- If the target we are chasing is gone, stop.
+    -- 1. Vitality Check: Ensure object still exists
+    if not self.object or self.object:get_pos() == nil then
+        ia_pathfinding.clear_pathing_state(self)
+        return
+    end
+
+    -- 2. Target Check: If the target we are chasing is gone, stop.
     if self._target_object and not ia_dunce.is_valid_object(self._target_object) then
         ia_pathfinding.clear_pathing_state(self)
         ia_dunce.stop(self)
         return
     end
 
-    -- Door Handling: Since the pathfinder now treats doors as air,
-    -- we check the node ahead and open it if it's a door.
-    if self._current_path then
-        local ahead = ia_dunce.get_relative_node_pos(self, 1, 0)
-        local node = minetest.get_node(ahead)
-        if minetest.get_item_group(node.name, "door") > 0 then
-            ia_dunce.handle_door_front(self, "open")
-        end
-    end
+    -- Movement logic is handled by follow_path() in the on_step.
 end

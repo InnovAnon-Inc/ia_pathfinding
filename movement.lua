@@ -1,5 +1,6 @@
 -- ia_pathfinding/movement.lua
 -- NOTE must handle optionally digging, climbing, swimming, flying, etc
+-- FIXME they hop on flat terrain
 
 --- Helper: Checks if the entity is on the ground.
 function ia_pathfinding.is_entity_on_ground(self)
