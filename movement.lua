@@ -27,7 +27,8 @@ function ia_pathfinding.move_to_waypoint(self, target)
     local dist_xz = vector.distance({x=target.x, y=0, z=target.z}, {x=my_pos.x, y=0, z=my_pos.z})
     
     -- If we are at the waypoint, stop moving and signal to increment path
-    if dist_xz < 0.3 and math.abs(target.y - my_pos.y) < 1.2 then
+    --if dist_xz < 0.3 and math.abs(target.y - my_pos.y) < 1.2 then
+    if dist_xz <= 0.3 and math.abs(target.y - my_pos.y) < 1.2 then
         ia_dunce.stop(self)
         return true
     end
@@ -63,33 +64,63 @@ function ia_pathfinding.move_to_waypoint(self, target)
 end
 
 --- Iterates through the current path.
+--function ia_pathfinding.follow_path(self)
+--    if not self._current_path then return false end
+--
+--    -- 1. Check if the target object is still there before taking a step
+--    -- This prevents walking toward items that players already picked up
+--    if self._target_object and not ia_dunce.is_valid_object(self._target_object) then
+--        minetest.log('info', '[ia_pathfinding] Target lost, clearing path')
+--        ia_pathfinding.clear_pathing_state(self)
+--        ia_dunce.stop(self)
+--        return false
+--    end
+--
+--    local waypoint = self._current_path[self._path_index]
+--    
+--    -- 2. Handle Path Completion
+--    if not waypoint then
+--        -- We reached the end of the calculated path
+--        local data = self._target_data
+--        
+--        -- IMMEDIATELY clear state so on_step doesn't call follow_path again
+--        ia_pathfinding.clear_pathing_state(self)
+--        ia_dunce.stop(self)
+--
+--        -- 3. Perform the actual action (Pickup/Equip)
+--        if data then
+--            ia_pathfinding.perform_arrival_action(self, data)
+--        end
+--        return true
+--    end
+--
+--    -- 3. Move toward current waypoint
+--    if ia_pathfinding.move_to_waypoint(self, waypoint) then
+--        self._path_index = self._path_index + 1
+--    end
+--    
+--    return false
+--end
+--- Iterates through the current path.
 function ia_pathfinding.follow_path(self)
     if not self._current_path then return false end
 
-    -- 1. Check if the target object is still there before taking a step
-    -- This prevents walking toward items that players already picked up
+    -- 1. Check if the target object is still there
     if self._target_object and not ia_dunce.is_valid_object(self._target_object) then
-        minetest.log('info', '[ia_pathfinding] Target lost, clearing path')
         ia_pathfinding.clear_pathing_state(self)
         ia_dunce.stop(self)
         return false
     end
 
     local waypoint = self._current_path[self._path_index]
+    --minetest.log('info', "[ia_pathfinding] Moving to waypoint " .. self._path_index)
+    minetest.log("[ia_pathfinding] Moving to waypoint " .. self._path_index)
     
-    -- 2. Handle Path Completion
+    -- 2. Handle Path Completion (Arrival at the end of the CURRENT path segment)
     if not waypoint then
-        -- We reached the end of the calculated path
-        local data = self._target_data
-        
-        -- IMMEDIATELY clear state so on_step doesn't call follow_path again
-        ia_pathfinding.clear_pathing_state(self)
-        ia_dunce.stop(self)
-
-        -- 3. Perform the actual action (Pickup/Equip)
-        if data then
-            ia_pathfinding.perform_arrival_action(self, data)
-        end
+        -- We reached the end of the current task's path.
+        -- Trigger the Task Stack arrival logic instead of hardcoded pickup.
+        ia_pathfinding.on_reach_destination(self)
         return true
     end
 

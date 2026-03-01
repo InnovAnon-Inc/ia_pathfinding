@@ -1,5 +1,6 @@
 -- ia_pathfinding/scavenge.lua
 -- NOTE must handle optionally searching within chests & stealing
+-- NOTE must handle nodes & items
 
 ------- Scavenges for items with support for counts, groups, and custom filters.
 ------ @param requirements Table like { ["group:armor"] = true, ["default:stone"] = 8 }
@@ -186,8 +187,13 @@
 --end
 -- ia_pathfinding/scavenge.lua
 
+--function ia_pathfinding.is_idle(self)
+--    return self._current_path == nil
+--end
 function ia_pathfinding.is_idle(self)
-    return self._current_path == nil
+    local has_path = self._current_path ~= nil
+    local has_tasks = self._task_stack ~= nil and #self._task_stack > 0
+    return not (has_path or has_tasks)
 end
 
 --- Internal helper to check item requirements.
@@ -216,6 +222,7 @@ end
 --end
 -- ia_pathfinding/scavenge.lua
 
+-- FIXME must handle nodes and items
 local function matches_requirement(stack, requirements, self)
     local name = stack:get_name()
     -- Add logging to see what items are being scanned against requirements
@@ -322,41 +329,115 @@ end
 ---- TODO arrive & dig (shovel), arrive & mine (pickaxe), arrive & chop, arrive & till, etc.
 -- ia_pathfinding/scavenge.lua
 
+----function ia_pathfinding.handle_scavenging(self, requirements)
+----    assert(requirements)
+----
+----    -- 1. BRAIN: Only look for new items if we aren't already walking to one.
+----    if ia_pathfinding.is_idle(self) then
+----        local filter = function(stack) return matches_requirement(stack, requirements, self) end
+----        local items = self:find_items(20, filter)
+----        
+----        if #items > 0 then
+----            local target = items[1]
+----            
+----            -- Set the object for tracking validity
+----            self._target_object = target.object
+----            
+----            -- CHANGE: Explicitly set _target_data so perform_arrival_action knows what to do
+----            self._target_data = {
+----                type = "item",
+----                object = target.object,
+----                pos = target.pos
+----            }
+----            
+----            minetest.log('action', string.format("[ia_pathfinding] %s targeted %s at %s", 
+----                self.mob_name, 
+----                target.object:get_luaentity().itemstring, 
+----                minetest.pos_to_string(target.pos)
+----            ))
+----
+----            self:find_path_to(target.pos)
+----        end
+----    end
+----
+----    -- 2. LEGS: If we have a path, walk it.
+----    if not ia_pathfinding.is_idle(self) then
+----        self:follow_path()
+----        return true
+----    end
+----
+----    return false
+----end
+---- mods/ia_pathfinding/scavenge.lua
+--
+--function ia_pathfinding.handle_scavenging(self, requirements)
+--    assert(requirements)
+--
+--    -- 1. BRAIN: Only look for new items if the stack is totally empty.
+--    -- If we have a task (like a Door detour), don't look for new apples!
+--    if not self._task_stack or #self._task_stack == 0 then
+--        local filter = function(stack) return matches_requirement(stack, requirements, self) end
+--        local items = self:find_items(20, filter)
+--        
+--        if #items > 0 then
+--            local target = items[1]
+--            self._target_object = target.object
+--            self._target_data = {
+--                type = "item",
+--                object = target.object,
+--                pos = target.pos
+--            }
+--            
+--            -- This will push the "goal" and potentially a "door" detour
+--            self:find_path_to(target.pos)
+--        end
+--    end
+--
+--    -- 2. LEGS: If we have a path, walk it.
+--    -- Note: is_idle should check if _current_path exists
+--    if not ia_pathfinding.is_idle(self) then
+--        self:follow_path()
+--        return true
+--    end
+--
+--    return false
+--end
+-- mods/ia_pathfinding/scavenge.lua
+
 function ia_pathfinding.handle_scavenging(self, requirements)
     assert(requirements)
 
-    -- 1. BRAIN: Only look for new items if we aren't already walking to one.
-    if ia_pathfinding.is_idle(self) then
+    -- 1. If we are ALREADY moving or have a plan, just keep walking.
+    -- This prevents the "analysis paralysis" where it re-paths every 2 seconds.
+    if not ia_pathfinding.is_idle(self) then
+        self:follow_path()
+        return true
+    end
+
+    -- 2. Only if we are truly idle and have no tasks, do we look for items.
+    if not self._task_stack or #self._task_stack == 0 then
         local filter = function(stack) return matches_requirement(stack, requirements, self) end
-        local items = self:find_items(20, filter)
+        local items = self:find_items(20, filter) -- find_items_or_nodes()
         
         if #items > 0 then
             local target = items[1]
-            
-            -- Set the object for tracking validity
+            -- Set the metadata before calling find_path_to
             self._target_object = target.object
-            
-            -- CHANGE: Explicitly set _target_data so perform_arrival_action knows what to do
             self._target_data = {
                 type = "item",
                 object = target.object,
                 pos = target.pos
             }
             
-            minetest.log('action', string.format("[ia_pathfinding] %s targeted %s at %s", 
-                self.mob_name, 
-                target.object:get_luaentity().itemstring, 
-                minetest.pos_to_string(target.pos)
-            ))
-
-            self:find_path_to(target.pos)
+            -- This sets _current_path and _task_stack
+            ia_pathfinding.find_path_to(self, target.pos)
+            
+            -- Start moving immediately on the same frame
+            if not ia_pathfinding.is_idle(self) then
+                self:follow_path()
+                return true
+            end
         end
-    end
-
-    -- 2. LEGS: If we have a path, walk it.
-    if not ia_pathfinding.is_idle(self) then
-        self:follow_path()
-        return true
     end
 
     return false

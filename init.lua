@@ -7,6 +7,7 @@ local files = {
     "pathfinding",
     "registration",
     "scavenge",
+    --"task",
 }
 
 local path = minetest.get_modpath("ia_pathfinding")
