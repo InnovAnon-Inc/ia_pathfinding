@@ -25,7 +25,7 @@ function ia_pathfinding.register_pathfinding_entity(name, definition)
         --end
 
 	local hp = self:get_hp()
-	minetest.log('ia_pathfinding.on_step() '..self:get_player_name()..' hp='..hp)
+	--minetest.log('ia_pathfinding.on_step() '..self:get_player_name()..' hp='..hp)
 	if hp <= 0 then
             return
         end
@@ -36,10 +36,11 @@ function ia_pathfinding.register_pathfinding_entity(name, definition)
         end
     end
 
+    -- TODO ensure that this doesn't run twice
     -- We must override the on_activate that ia_dunce would have set
     final_def.on_activate = function(self, staticdata, dtime_s)
         -- 1. Initialize Dunce (Base Layer)
-        ia_dunce.init_instance(self)
+        --ia_dunce.init_instance(self)
         assert(self:is_player() == true)
         
         -- 2. Initialize Pathfinding (This Layer - provides handle_scavenging, etc.)
