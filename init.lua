@@ -3,6 +3,8 @@
 ia_pathfinding = {}
 
 local files = {
+    "doors",
+    "ladder",
     "movement",
     "pathfinding",
     "registration",
