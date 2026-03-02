@@ -1,5 +1,17 @@
 -- ia_pathfinding/pathfinding.lua
 -- NOTE must handle optionally digging, climbing, swimming, flying, etc
+--
+-- Requirements: ia_pathfinding/pathfinding.lua
+--   Task Stack Ownership: Must maintain a stack where the bottom is the goal and higher entries are the "Bridges" (doors/ladders) needed to reach it.
+--   Recursive Validation:
+--     Attempt star from current_pos to top_task.
+--     If star fails, scan for nearby interactables (doors).
+--     Test if star can reach the interactable.
+--     If yes, push the interactable to the stack as a new top_task.
+--   Canonical Start/End:
+--     A* searches must always use vector.round(access_point) as the source/destination for doors to ensure star doesn't evaluate inside a collision box.
+--   State Clean-up: Must pop the task and clear _current_path only when the specific "Bridge" logic (in doors.lua) signals completion.
+--   Stalemate Prevention: If the stack is empty or star fails with no detectable obstacles, trigger a short direct-walk fallback to resolve rounding jitter.
 
 local function log_trace(msg)
     minetest.log('info', '[ia_pathfinding][TRACE] ' .. msg)
@@ -39,14 +51,11 @@ function ia_pathfinding.get_search_settings(self)
     }
 end
 
-
 --- Helper: Returns the current top task.
 function ia_pathfinding.get_current_task(self)
     if not self._task_stack or #self._task_stack == 0 then return nil end
     return self._task_stack[#self._task_stack]
 end
-
---- Helper: Pops the top task from the stack.
 
 -- Update clear_pathing_state to include the stack
 function ia_pathfinding.clear_pathing_state(self)
@@ -83,149 +92,181 @@ function ia_pathfinding.pop_task(self)
     return nil
 end
 
-local function get_best_access_point(my_pos, target_pos)
-    local neighbors = {
-        {x=target_pos.x+1, y=target_pos.y, z=target_pos.z},
-        {x=target_pos.x-1, y=target_pos.y, z=target_pos.z},
-        {x=target_pos.x, y=target_pos.y, z=target_pos.z+1},
-        {x=target_pos.x, y=target_pos.y, z=target_pos.z-1}
-    }
-
-    local best_node = nil
-    local min_dist = math.huge
-
-    for _, n in ipairs(neighbors) do
-        local node = minetest.get_node(n)
-        local def = minetest.registered_nodes[node.name]
-        -- Explicit assertion: Ensure we don't path into a solid block
-        if def and not def.walkable then
-            local d = vector.distance(my_pos, n)
-            if d < min_dist then
-                min_dist = d
-                best_node = n
-            end
-        end
-    end
-
-    if best_node then
-        log_trace("Best access point for " .. minetest.pos_to_string(target_pos) .. " is " .. minetest.pos_to_string(best_node))
-    end
-    return best_node or target_pos
-end
-
-function ia_pathfinding.process_pathfinding(self)
-    -- 1. Vitality Check
-    if not self.object or self.object:get_pos() == nil then
-        ia_pathfinding.clear_pathing_state(self)
-        return
-    end
-
-    -- 2. Target Check
-    if self._target_object and not ia_dunce.is_valid_object(self._target_object) then
-        log_trace("Target object lost, clearing state.")
-        ia_pathfinding.clear_pathing_state(self)
-        ia_dunce.stop(self)
-        return
-    end
-
-    -- 3. Iteration Logic: If we have a task but no path, trigger a search.
-    local current_task = ia_pathfinding.get_current_task(self)
-    if current_task and not self._current_path then
-        log_trace("Task exists but no path found. Triggering search for: " .. current_task.type)
-        ia_pathfinding.find_path_to(self, current_task.pos, current_task.type)
-    end
-end
-
+--- Arrival Logic
 function ia_pathfinding.on_reach_destination(self)
     local completed_task = ia_pathfinding.pop_task(self)
     ia_dunce.stop(self)
 
-    if not completed_task then
+    if not completed_task or completed_task.type == "goal" then
+        log_trace("Final goal reached.")
         ia_pathfinding.clear_pathing_state(self)
-        return
     end
 
-    if completed_task.type == "door" then
-        ia_pathfinding.traverse_doorway(self)
-    elseif completed_task.type == "ladder" then
-        -- NEW: Delegate to ladder module
-        ia_pathfinding.traverse_ladder(self)
-    elseif completed_task.type == "traverse" then
-        minetest.log('info', "[ia_pathfinding] Traversal/Bridge complete.")
-    elseif completed_task.type == "goal" then
-        local my_pos = self.object:get_pos()
-        if vector.distance(my_pos, completed_task.pos) < 1.5 then
-            if self._target_data then
-                ia_pathfinding.perform_arrival_action(self, self._target_data)
-            end
-        end
-        ia_pathfinding.clear_pathing_state(self)
-        return
-    end
-
+    -- Invalidate path so the next task in the stack (if any) generates a new one
     self._current_path = nil
 end
 
-function ia_pathfinding.find_path_to(self, target_pos, task_type)
-    assert(self.object, "find_path_to: self.object is nil")
-    local my_pos = self.object:get_pos()
-    if not my_pos or not target_pos then return end
+-- ia_pathfinding/pathfinding.lua
 
-    -- Stack management
-    self._task_stack = self._task_stack or {}
-    if #self._task_stack == 0 then
+-- mods/ia_pathfinding/pathfinding.lua
+
+function ia_pathfinding.process_pathfinding(self)
+    -- 0. Basic Sanity
+    if not self.object or not self.object:get_pos() then
+        ia_pathfinding.clear_pathing_state(self)
+        return
+    end
+
+    -- 1. GOAL VALIDATION (Priority)
+    -- If the apple/target is gone, we MUST break out of bridges and paths immediately.
+    -- Assuming self._target_object is how you track the apple entity.
+    local target_lost = self._target_object and not self._target_object:get_pos()
+    
+    if target_lost then
+        log_trace("Target lost mid-process. Clearing all state.")
+        ia_pathfinding.clear_pathing_state(self)
+        self._bridge_step = nil -- Force break the bridge latch
+        self._bridge_exit_target = nil
+        ia_dunce.stop(self)
+        return
+    end
+
+    local current_task = ia_pathfinding.get_current_task(self)
+    if not current_task then return end
+
+    local my_pos = self.object:get_pos()
+    local dist_to_task = vector.distance(my_pos, current_task.pos)
+    local is_bridge = (current_task.type == "door" or current_task.type == "ladder")
+
+    -- 2. BRIDGE DELEGATION
+    if self._bridge_step or (is_bridge and dist_to_task < 1.4) then
+        if self._current_path then
+            log_trace("Hand-off: Entering atomic bridge mode for " .. current_task.type)
+            self._current_path = nil 
+            ia_dunce.stop(self)
+        end
+
+        local bridge_finished = false
+        if current_task.type == "door" then
+            bridge_finished = ia_pathfinding.use_door_bridge(self, current_task.pos)
+        elseif current_task.type == "ladder" then
+            bridge_finished = ia_pathfinding.use_ladder_bridge(self, current_task.pos)
+        end
+
+        if bridge_finished then
+            log_trace("Bridge sequence complete: " .. current_task.type)
+            ia_pathfinding.pop_task(self)
+            self._bridge_step = nil
+            self._current_path = nil
+        end
+        return 
+    end
+
+    -- 3. STANDARD MOVEMENT EXECUTION
+    if self._current_path then
+        local target = self._current_path[self._path_index]
+        ia_dunce.walk(self, target)
+
+        if vector.distance(my_pos, target) < 0.5 then
+            self._path_index = self._path_index + 1
+            if self._path_index > #self._current_path then
+                ia_pathfinding.on_reach_destination(self)
+            end
+        end
+    else
+        -- 4. PATH SEARCHING
+        ia_pathfinding.find_path_to(self, current_task.pos, current_task.type)
+    end
+end
+
+--- RECURSIVE VALIDATION: Find a bridge (door) that star can reach.
+-- This fulfills the requirement to piece together the path via obstacles.
+local function find_reachable_bridge(self, my_pos, goal_pos)
+    local doors = ia_dunce.find_nearby_doors(my_pos, 5)
+    if not doors or #doors == 0 then return nil end
+
+    local settings = ia_pathfinding.get_search_settings(self)
+    local start_node = vector.round(my_pos)
+
+    for _, d in ipairs(doors) do
+        local pts = ia_pathfinding.get_door_access_points(d.pos)
+        -- Canonical Start/End: Always round the access point for star
+        local target_node = vector.round(pts.front)
+        if vector.distance(my_pos, pts.front) > vector.distance(my_pos, pts.back) then
+            target_node = vector.round(pts.back)
+        end
+
+        -- Can star reach this door's access point?
+        local test_path = star.find_path(start_node, target_node, settings)
+        if test_path and #test_path > 0 then
+            -- Verify this door actually gets us closer to the goal than we are now
+            if vector.distance(d.pos, goal_pos) < vector.distance(my_pos, goal_pos) then
+                log_trace("Bridge Found: Star can reach door at " .. minetest.pos_to_string(d.pos))
+                return d.pos
+            end
+        end
+    end
+    return nil
+end
+
+function ia_pathfinding.find_path_to(self, target_pos, task_type)
+    local my_pos = self.object:get_pos()
+    if not my_pos then return end
+
+    -- Task Stack Ownership: Ensure we always have a goal
+    if not self._task_stack or #self._task_stack == 0 then
         ia_pathfinding.push_task(self, target_pos, task_type or "goal")
     end
 
     local current_task = ia_pathfinding.get_current_task(self)
     local start = vector.round(my_pos)
-    local dest = vector.round(current_task.pos)
+    local search_dest = vector.round(current_task.pos)
 
-    -- Traverse bypass: Direct movement for bridges
-    if current_task.type == "traverse" then
-        self._current_path = {dest}
-        self._path_index = 1
-        self._path_target = vector.new(dest)
-        return
+    -- Canonical Start/End: If we are near a door, snap start to the access point node
+    local nearby_doors = ia_dunce.find_nearby_doors(my_pos, 2)
+    if nearby_doors and #nearby_doors > 0 then
+        local pts = ia_pathfinding.get_door_access_points(nearby_doors[1].pos)
+        if vector.distance(my_pos, pts.front) < 0.8 then
+            start = vector.round(pts.front)
+        elseif vector.distance(my_pos, pts.back) < 0.8 then
+            start = vector.round(pts.back)
+        end
     end
 
-    -- Arrival Check
-    local dist = vector.distance(my_pos, current_task.pos)
-    if dist < 1.2 then
-        ia_pathfinding.on_reach_destination(self)
-        return
+    -- If the current top task is a door, search_dest is its closest access point node
+    if current_task.type == "door" then
+        local pts = ia_pathfinding.get_door_access_points(current_task.pos)
+        search_dest = vector.round(vector.distance(my_pos, pts.front) < vector.distance(my_pos, pts.back)
+                      and pts.front or pts.back)
     end
 
-    -- Target selection for A*
-    local search_dest = dest
-    if current_task.type == "door" or current_task.type == "ladder" then
-        search_dest = get_best_access_point(my_pos, dest)
-    end
-
-    -- Execute A*
+    -- Execute Star Search
     local settings = ia_pathfinding.get_search_settings(self)
     local flat_result = star.find_path(start, search_dest, settings)
 
-    -- Detour Logic
-    if (not flat_result or #flat_result == 0) and current_task.type == "goal" then
-        -- Check Doors
-        if ia_pathfinding.handle_door_detour(self, start) then return end
+    -- Recursive Validation Logic
+    if (not flat_result or #flat_result == 0) then
+        if current_task.type == "goal" or current_task.type == "move" then
+            -- Star failed to goal; find a bridge we CAN reach.
+            local bridge_pos = find_reachable_bridge(self, my_pos, current_task.pos)
+            if bridge_pos then
+                ia_pathfinding.push_task(self, bridge_pos, "door")
+                return -- Next frame will process the new top task (the door)
+            end
+        end
 
-        -- Check Ladders
-        if ia_pathfinding.handle_ladder_detour(self, start) then return end
+        -- Stalemate Prevention: Jitter resolution
+        if vector.distance(my_pos, search_dest) < 1.1 then
+            log_trace("Stalemate: Forcing direct walk to " .. minetest.pos_to_string(search_dest))
+            ia_dunce.walk(self, search_dest)
+            return
+        end
     end
 
-    -- Path Assignment
-    local formatted_path = format_star_path(flat_result)
-    if formatted_path and #formatted_path > 0 then
-        self._current_path = formatted_path
+    -- Apply Path if found
+    local formatted = format_star_path(flat_result)
+    if formatted then
+        self._current_path = formatted
         self._path_index = 1
-        self._path_target = vector.new(dest)
-    elseif (current_task.type == "door" or current_task.type == "ladder") and dist < 5 then
-        -- Blind approach for interactive nodes that A* might struggle to center on
-        self._current_path = {vector.round(current_task.pos)}
-        self._path_index = 1
-    else
-        ia_pathfinding.clear_pathing_state(self)
     end
 end
