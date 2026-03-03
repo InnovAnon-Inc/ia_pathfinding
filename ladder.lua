@@ -1,130 +1,109 @@
 -- ia_pathfinding/ladder.lua
+--
+-- Requirements: ia_pathfinding/ladder.lua
+--   Access Point Calculation: Provide 'entry' and 'exit' vectors.
+--     The entry is the horizontal landing in front of the ladder base/current level.
+--     The exit is the horizontal landing at the target height to clear the ladder's collision.
+--   Atomic Execution (Bridge):
+--     Once a ladder task is top-of-stack, ladder.lua takes control via _bridge_step.
+--     Phase 1 (Mount): Move horizontally to the ladder's base entry point.
+--     Phase 2 (Climb): Vertical movement until target Y is reached.
+--     Phase 3 (Dismount): Move horizontally to the exit point to clear the ladder.
+--   Completion Signal: Return true only when the mob has successfully stepped onto the exit landing.
+--   Obstacle Verification: provide helper to verify if a ladder is reachable and helps bridge a vertical gap.
 
---- Helper: Finds a valid landing node adjacent to the ladder at a specific height.
--- @param ladder_pos Vector of the ladder column
--- @param target_y The Y level we want to step off at
--- @param face_offset The vector pointing from the ladder to the standing space
-local function find_valid_landing(ladder_pos, target_y, face_offset)
-    local landing = vector.add({x=ladder_pos.x, y=target_y, z=ladder_pos.z}, face_offset)
-    local node = minetest.get_node(landing)
-    local def = minetest.registered_nodes[node.name]
+-- ia_pathfinding/ladder.lua
 
-    -- If the direct landing is walkable (solid), we are stuck.
-    -- We'll add a small check for the node above it (head space).
-    local head_pos = vector.add(landing, {x=0, y=1, z=0})
-    local head_node = minetest.get_node(head_pos)
-    local head_def = minetest.registered_nodes[head_node.name]
-
-    if def and not def.walkable and head_def and not head_def.walkable then
-        return landing
-    end
-
-    return nil
+local function log_trace(msg)
+    minetest.log('info', '[ia_pathfinding][TRACE] ' .. msg)
 end
 
---function ia_pathfinding.get_ladder_points(ladder_pos, target_y)
---    -- Use the atomic Dunce helper to get the standing offset
---    local offset = ia_dunce.get_ladder_vectors(ladder_pos)
---
---    -- Determine intended exit Y (where the goal actually is)
---    local exit_y = math.floor(target_y + 0.5)
---
---    -- Try to find a valid landing at the target height, or +/- 1
---    local landing = find_valid_landing(ladder_pos, exit_y, offset)
---    if not landing then
---        landing = find_valid_landing(ladder_pos, exit_y + 1, offset) or
---                  find_valid_landing(ladder_pos, exit_y - 1, offset)
---    end
---
---    -- If no air is found, we fall back to the offset position at target height
---    local final_exit = landing or vector.add({x=ladder_pos.x, y=exit_y, z=ladder_pos.z}, offset)
---
---    return {
---        entry = vector.add(ladder_pos, offset),
---        exit = final_exit
---    }
---end
--- mods/ia_pathfinding/ladder.lua
-
-function ia_pathfinding.get_ladder_points(ladder_pos, target_y)
-    -- ia_dunce.get_ladder_vectors usually returns the direction the ladder is FACING.
-    -- We need to stand in FRONT of it.
+--- Helper: Returns the horizontal offset required to stand in front of the ladder.
+function ia_pathfinding.get_ladder_access_points(ladder_pos, target_y)
+    -- ia_dunce.get_ladder_vectors returns the direction the ladder "faces" (the wall normal).
     local dir = ia_dunce.get_ladder_vectors(ladder_pos)
-    
-    -- If dir is the wall-normal, the entry point should be ladder_pos + dir
-    local entry = vector.add(ladder_pos, dir)
-    
-    -- LOGGING: Is the entry point inside a wall?
-    local node = minetest.get_node(entry)
-    minetest.log("action", string.format("[ia_debug] Ladder at %s. Entry: %s (Node: %s)", 
-        minetest.pos_to_string(ladder_pos), minetest.pos_to_string(entry), node.name))
 
-    -- Ensure the exit point is also shifted away from the ladder at the target height
+    -- Entry: The floor-level position in front of the ladder at the mob's current height.
+    local entry = vector.add(ladder_pos, dir)
+
+    -- Exit: The floor-level position in front of the ladder at the target height.
     local exit = vector.new(entry)
     exit.y = math.floor(target_y + 0.5)
 
-    return { entry = entry, exit = exit }
+    return {
+        entry = entry,
+        exit = exit
+    }
 end
 
---- Encapsulated Bridge API: The "High-Level" ladder handler.
--- Blocks pathfinding until the mob has successfully transitioned to the target height.
+--- Atomic Execution: Handles the physics-defying transition of climbing.
 function ia_pathfinding.use_ladder_bridge(self, ladder_pos)
     local my_pos = self.object:get_pos()
     if not my_pos then return false end
 
     -- 1. Determine Goal Height
-    -- We peek at the task below the ladder task to see where the mob actually wants to go.
+    -- Peek at the task below the ladder task (the goal) to see our desired Y.
     local goal_task = self._task_stack[#self._task_stack - 1]
     local target_y = goal_task and goal_task.pos.y or ladder_pos.y
 
-    local points = ia_pathfinding.get_ladder_points(ladder_pos, target_y)
+    local points = ia_pathfinding.get_ladder_access_points(ladder_pos, target_y)
 
-    -- 2. State Management
-    self._bridge_step = self._bridge_step or "MOUNT"
+    -- 2. Initialize Bridge State
+    if not self._bridge_step then
+        self._bridge_step = "MOUNT"
+        log_trace("Bridge START: Ladder at " .. minetest.pos_to_string(ladder_pos) .. " targeting Y=" .. target_y)
+    end
 
+    -- 3. Execute Steps
     if self._bridge_step == "MOUNT" then
-        -- Move horizontally into the ladder's "climbable" zone
-        local arrived = not ia_dunce.walk(self, points.entry)
-        if arrived then
+        -- Step 1: Get to the base of the ladder
+        -- Use horizontal distance check to avoid Y-diff jitter during approach
+        local dist_h = vector.distance({x=my_pos.x, y=0, z=my_pos.z}, {x=points.entry.x, y=0, z=points.entry.z})
+
+        if dist_h < 0.3 then
             self._bridge_step = "CLIMB"
-            minetest.log('action', "[ia_pathfinding] Ladder mounted, beginning climb.")
+            log_trace("Ladder MOUNTED. Beginning vertical phase.")
+        else
+            ia_dunce.walk(self, points.entry)
         end
         return false
 
     elseif self._bridge_step == "CLIMB" then
-        -- Vertical movement via Dunce
-        ia_dunce.climb(self, target_y)
+        -- Step 2: Move vertically
+        -- We call walk(points.entry) to keep X/Z locked so we don't slip off the ladder
+        ia_dunce.walk(self, points.entry)
 
-        -- Check if we have reached the target altitude (within a small margin)
-        if math.abs(my_pos.y - target_y) < 0.5 then
+        local is_up = target_y > my_pos.y
+        local finished = false
+
+        if is_up then
+            ia_dunce.climb_up(self, target_y)
+            finished = ia_dunce.is_at_climb_up_target(self, target_y)
+        else
+            ia_dunce.climb_down(self, target_y)
+            finished = ia_dunce.is_at_climb_down_target(self, target_y)
+        end
+
+        if finished then
             self._bridge_step = "DISMOUNT"
+            log_trace("Target height reached. DISMOUNTING...")
         end
         return false
 
     elseif self._bridge_step == "DISMOUNT" then
-        -- Move horizontally to the landing/exit point to clear the ladder
-        local arrived = not ia_dunce.walk(self, points.exit)
-        if arrived then
-            -- Sequence Complete
+        -- Step 3: Step off the ladder onto solid ground
+        -- We use ia_dunce.walk which will now benefit from any ledge clearing velocity
+        ia_dunce.walk(self, points.exit)
+
+        local dist_total = vector.distance(my_pos, points.exit)
+        if dist_total < 0.4 then
             ia_dunce.stop(self)
             self._bridge_step = nil
-            minetest.log('action', "[ia_pathfinding] Ladder dismounted at Y=" .. target_y)
+            log_trace("Bridge COMPLETE: Ladder dismounted.")
             return true
         end
         return false
     end
 
-    return false
-end
-
---- Scans for ladders to bridge vertical gaps.
-function ia_pathfinding.handle_ladder_detour(self, pos)
-    -- Dunce-level sensor for ladder nodes
-    local ladders = ia_dunce.find_nearby_ladders(pos, 8)
-    if ladders and #ladders > 0 then
-        minetest.log('info', "[ia_pathfinding] Found ladder detour at " .. minetest.pos_to_string(ladders[1]))
-        ia_pathfinding.push_task(self, ladders[1], "ladder")
-        return true
-    end
     return false
 end
