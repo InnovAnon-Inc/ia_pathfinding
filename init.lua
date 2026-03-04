@@ -1,31 +1,37 @@
 -- ia_pathfinding/init.lua
 
-ia_pathfinding = {}
+assert(minetest.get_modpath('ia_util'))
+assert(ia_util ~= nil)
+local modname                    = minetest.get_current_modname() or "ia_pathfinding"
+local storage                    = minetest.get_mod_storage()
+ia_pathfinding                   = {}
+--local files = {
+--    "doors",
+--    "ladder",
+--    "movement",
+--    "pathfinding",
+--    "registration",
+--    "scavenge",
+--    --"task",
+--    "util",
+--}
+local modpath, S                 = ia_util.loadmod(modname)
+local log                        = ia_util.get_logger(modname)
+local assert                     = ia_util.get_assert(modname)
 
-local files = {
-    "doors",
-    "ladder",
-    "movement",
-    "pathfinding",
-    "registration",
-    "scavenge",
-    --"task",
-    "util",
-}
-
-local path = minetest.get_modpath("ia_pathfinding")
-
-for _, file in ipairs(files) do
-    local script = path .. "/" .. file .. ".lua"
-    -- UPDATED: Capture 'err' to show the exact syntax error in the console
-    local chunk, err = loadfile(script)
-    
-    if not chunk then
-        error("\n[ia_pathfinding] Syntax error in " .. file .. ".lua: " .. tostring(err))
-    end
-    
-    chunk()
-end
+--local path = minetest.get_modpath("ia_pathfinding")
+--
+--for _, file in ipairs(files) do
+--    local script = path .. "/" .. file .. ".lua"
+--    -- UPDATED: Capture 'err' to show the exact syntax error in the console
+--    local chunk, err = loadfile(script)
+--    
+--    if not chunk then
+--        error("\n[ia_pathfinding] Syntax error in " .. file .. ".lua: " .. tostring(err))
+--    end
+--    
+--    chunk()
+--end
 
 function ia_pathfinding.init_instance(self_obj)
     -- Inject all functions into the entity
